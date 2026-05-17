@@ -270,23 +270,42 @@ func cmdRun(log *slog.Logger, _ []string) int {
 	}
 	defer t.Close()
 
-	// Local listener for the gateway. The eRetail MQTT broker on the
-	// cloud listens on 9071, so we mirror the port locally — gateway
-	// can keep its default config.
-	srv := &proxy.Server{
+	// Local listeners for the gateway. Two ports because eRetail's
+	// hardware speaks one of two protocols depending on generation:
+	//   9071 — old Cronus (AP03) TCP, used by eRetail 3.1/3.2 SendServer
+	//   9080 — newer eStation (AP04) MQTT, per D20 dev manual default
+	// Both upstreams are the same cloud server addr — the gateway
+	// picks whichever protocol it speaks.
+	srv9080 := &proxy.Server{
+		Listen:   "0.0.0.0:9080",
+		Upstream: dialAddr(cfg.ServerAddr, 9080),
+		Dialer:   t,
+		Logger:   log,
+	}
+	srv9071 := &proxy.Server{
 		Listen:   "0.0.0.0:9071",
-		Upstream: cfg.ServerAddr,
+		Upstream: dialAddr(cfg.ServerAddr, 9071),
 		Dialer:   t,
 		Logger:   log,
 	}
 
-	// Heartbeats in parallel with the proxy. Both share ctx so
+	// Heartbeats in parallel with both proxies. They share ctx so
 	// Ctrl-C cleanly shuts everything down.
 	cli := api.New(cfg.EsbmAppURL, cfg.BridgeJWT)
-	go heartbeatLoop(ctx, log, cli, srv)
+	go heartbeatLoop(ctx, log, cli, srv9080, srv9071)
 
-	log.Info("bridge running", "shop_code", cfg.ShopCode, "version", version)
-	if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	log.Info("bridge running", "shop_code", cfg.ShopCode, "version", version,
+		"listen", []string{"0.0.0.0:9071", "0.0.0.0:9080"})
+
+	// Run both proxies concurrently. Whichever returns first wins
+	// and we tear the other down via ctx cancellation.
+	errCh := make(chan error, 2)
+	go func() { errCh <- srv9071.Run(ctx) }()
+	go func() { errCh <- srv9080.Run(ctx) }()
+	err = <-errCh
+	cancel()
+	<-errCh // wait for the other goroutine to drain
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("proxy stopped with error", "err", err)
 		return 1
 	}
@@ -294,10 +313,30 @@ func cmdRun(log *slog.Logger, _ []string) int {
 	return 0
 }
 
+// dialAddr rewrites the upstream port — config.ServerAddr stores ONE
+// "host:port" but we want different upstream ports per listener.
+// Returns "<host>:<port>" with the host preserved.
+func dialAddr(serverAddr string, port int) string {
+	host := serverAddr
+	if i := indexLastColon(serverAddr); i >= 0 {
+		host = serverAddr[:i]
+	}
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+func indexLastColon(s string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == ':' {
+			return i
+		}
+	}
+	return -1
+}
+
 // heartbeatLoop fires once at startup so the dashboard flips to
 // green immediately, then every 60s. Failures are logged but never
 // kill the proxy — the gateway → cloud path is what matters.
-func heartbeatLoop(ctx context.Context, log *slog.Logger, cli *api.Client, srv *proxy.Server) {
+func heartbeatLoop(ctx context.Context, log *slog.Logger, cli *api.Client, servers ...*proxy.Server) {
 	start := time.Now()
 	tick := time.NewTicker(60 * time.Second)
 	defer tick.Stop()
@@ -305,10 +344,17 @@ func heartbeatLoop(ctx context.Context, log *slog.Logger, cli *api.Client, srv *
 	send := func() {
 		c, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
+		// Sum MQTT byte counters across every listener — the
+		// dashboard cares about traffic regardless of which port
+		// the gateway happened to dial.
+		var msgs int64
+		for _, s := range servers {
+			msgs += s.MsgsLastMin()
+		}
 		err := cli.SendHeartbeat(c, api.Heartbeat{
 			UptimeSec:       int64(time.Since(start).Seconds()),
 			Version:         version,
-			MQTTMsgsLastMin: srv.MsgsLastMin(),
+			MQTTMsgsLastMin: msgs,
 			TailscaleOK:     true,
 		})
 		if err != nil {
