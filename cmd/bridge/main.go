@@ -38,6 +38,13 @@ var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
+		// On Windows a double-click from Explorer flashes a console
+		// and dies — keep the window open with an instruction sheet.
+		// In a real terminal or other OS, just print usage normally.
+		if launchedFromExplorer() {
+			holdConsoleAndReport()
+			os.Exit(0)
+		}
 		usage()
 		os.Exit(2)
 	}

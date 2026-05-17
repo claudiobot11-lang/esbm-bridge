@@ -16,3 +16,4 @@ state.json
 *.swp
 .DS_Store
 Icon?
+.github/
