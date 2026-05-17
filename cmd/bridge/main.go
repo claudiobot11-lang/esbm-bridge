@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -23,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -37,22 +39,24 @@ import (
 var version = "dev"
 
 func main() {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Default command for double-click from Windows Explorer: `setup`
+	// walks the operator from "I just downloaded an exe" all the way
+	// to "the bridge is running" in a single interactive flow. From
+	// a real terminal we still want help() on bare invocation.
 	if len(os.Args) < 2 {
-		// On Windows a double-click from Explorer flashes a console
-		// and dies — keep the window open with an instruction sheet.
-		// In a real terminal or other OS, just print usage normally.
 		if launchedFromExplorer() {
-			holdConsoleAndReport()
-			os.Exit(0)
+			os.Exit(cmdSetup(log, nil))
 		}
 		usage()
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
 	switch cmd {
+	case "setup":
+		os.Exit(cmdSetup(log, args))
 	case "pair":
 		os.Exit(cmdPair(log, args))
 	case "run":
@@ -74,13 +78,111 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `esbm-bridge %s
 
 Usage:
-  esbm-bridge pair   --code CODE [--server URL]   Pair with esbm-app once
+  esbm-bridge setup                                Pair + start, interactive (the easy way)
+  esbm-bridge pair   --code CODE [--server URL]   Pair with esbm-app once (scripting)
   esbm-bridge run                                  Start the bridge service
   esbm-bridge status                               Show paired state
   esbm-bridge version                              Print version
 
 Pairing codes come from the esbm-app /esl/stores page.
+On Windows, double-click the .exe to launch ` + "`setup`" + ` interactively.
 `, version)
+}
+
+// cmdSetup is the operator-friendly path: pair (if needed) then run.
+// Designed so a non-technical user can double-click the .exe, type
+// the pairing code, and end up with a running bridge — without ever
+// touching cmd.exe themselves.
+func cmdSetup(log *slog.Logger, args []string) int {
+	fs := flag.NewFlagSet("setup", flag.ExitOnError)
+	codeFlag := fs.String("code", "", "skip the prompt and use this pairing code")
+	server := fs.String("server", "https://esbm-app-production.up.railway.app",
+		"esbm-app base URL (override only for staging/dev)")
+	_ = fs.Parse(args)
+
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Println()
+	fmt.Println("============================================================")
+	fmt.Println("  ESBM Bridge", version, "— setup")
+	fmt.Println("============================================================")
+
+	// Step 1: pair if we don't already have a config.json.
+	cfg, err := config.Load()
+	if err != nil {
+		code := strings.TrimSpace(*codeFlag)
+		if code == "" {
+			fmt.Println()
+			fmt.Println("  Open the ESBM web app → /esl/stores → 'Add Store' to get")
+			fmt.Println("  a 6-digit pairing code. Codes expire in 10 minutes.")
+			fmt.Println()
+			fmt.Print("  Pairing code: ")
+			line, _ := reader.ReadString('\n')
+			code = strings.TrimSpace(line)
+		}
+		if code == "" {
+			fmt.Println("  No code entered — aborting.")
+			holdForEnter(reader)
+			return 2
+		}
+		fmt.Println("  Pairing with", *server, "…")
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		pr, perr := api.New(*server, "").Pair(ctx, code)
+		cancel()
+		if perr != nil {
+			fmt.Println("  PAIR FAILED:", perr)
+			holdForEnter(reader)
+			return 1
+		}
+		cfg = &config.Config{
+			BridgeJWT:        pr.JWT,
+			TailscaleAuthKey: pr.TailscaleAuthKey,
+			ShopCode:         pr.ShopCode,
+			ServerAddr:       pr.ServerAddr,
+			EsbmAppURL:       *server,
+		}
+		cfg.Defaults()
+		if err := cfg.Save(); err != nil {
+			fmt.Println("  SAVE FAILED:", err)
+			holdForEnter(reader)
+			return 1
+		}
+		fmt.Println("  Paired as", cfg.ShopCode)
+	} else {
+		fmt.Println()
+		fmt.Println("  Already paired as", cfg.ShopCode, "(server", cfg.ServerAddr+")")
+	}
+
+	// Step 2: ask whether to run now. Default Yes for the obvious
+	// happy path. Operator can answer "n" to just close — useful
+	// when they're checking pairing status.
+	fmt.Println()
+	fmt.Print("  Start the bridge now? [Y/n]: ")
+	answer, _ := reader.ReadString('\n')
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	if answer == "n" || answer == "no" {
+		fmt.Println()
+		fmt.Println("  Not starting. Run `esbm-bridge run` later, or double-click again.")
+		holdForEnter(reader)
+		return 0
+	}
+
+	fmt.Println()
+	fmt.Println("  Starting bridge — Ctrl+C to stop, or close this window.")
+	fmt.Println("============================================================")
+	fmt.Println()
+	// Delegate to the regular run path so we share startup, logging
+	// and shutdown semantics with the scripted invocation.
+	return cmdRun(log, nil)
+}
+
+// holdForEnter blocks until the operator presses Enter, used by the
+// Explorer double-click flow so the console window doesn't slam shut
+// before they can read the error.
+func holdForEnter(r *bufio.Reader) {
+	fmt.Println()
+	fmt.Println("  Press Enter to close.")
+	r.ReadString('\n')
 }
 
 func cmdPair(log *slog.Logger, args []string) int {
