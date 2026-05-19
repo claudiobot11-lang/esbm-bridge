@@ -3,6 +3,7 @@ module github.com/claudiobot11-lang/esbm-bridge
 go 1.26.3
 
 require (
+	fyne.io/systray v1.12.1
 	golang.org/x/sys v0.43.0
 	tailscale.com v1.98.2
 )

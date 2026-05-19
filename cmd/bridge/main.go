@@ -30,7 +30,10 @@ import (
 
 	"github.com/claudiobot11-lang/esbm-bridge/internal/api"
 	"github.com/claudiobot11-lang/esbm-bridge/internal/config"
+	"github.com/claudiobot11-lang/esbm-bridge/internal/dashboard"
 	"github.com/claudiobot11-lang/esbm-bridge/internal/proxy"
+	"github.com/claudiobot11-lang/esbm-bridge/internal/supervisor"
+	"github.com/claudiobot11-lang/esbm-bridge/internal/tray"
 	"github.com/claudiobot11-lang/esbm-bridge/internal/tunnel"
 	"github.com/claudiobot11-lang/esbm-bridge/internal/winservice"
 )
@@ -56,12 +59,18 @@ func main() {
 		return
 	}
 
-	// Default command for double-click from Windows Explorer: `setup`
-	// walks the operator from "I just downloaded an exe" all the way
-	// to "the bridge is running" in a single interactive flow. From
-	// a real terminal we still want help() on bare invocation.
+	// Default command for double-click from Windows Explorer:
+	//   - If we have a paired config already → start in tray mode
+	//     (the operator probably wants to monitor the running bridge).
+	//   - Otherwise fall back to `setup`, the interactive pairing
+	//     wizard, so a first-time user can finish setup without
+	//     touching cmd.exe.
+	// From a real terminal we still want help() on bare invocation.
 	if len(os.Args) < 2 {
 		if launchedFromExplorer() {
+			if _, err := config.Load(); err == nil {
+				os.Exit(cmdTray(log, nil))
+			}
 			os.Exit(cmdSetup(log, nil))
 		}
 		usage()
@@ -76,6 +85,8 @@ func main() {
 		os.Exit(cmdPair(log, args))
 	case "run":
 		os.Exit(cmdRun(log, args))
+	case "tray":
+		os.Exit(cmdTray(log, args))
 	case "install":
 		os.Exit(cmdInstall(log, args))
 	case "uninstall":
@@ -99,7 +110,8 @@ func usage() {
 Usage:
   esbm-bridge setup                                Pair + start, interactive (the easy way)
   esbm-bridge pair      --code CODE [--server URL] Pair with esbm-app once (scripting)
-  esbm-bridge run                                  Start the bridge in the foreground
+  esbm-bridge tray                                 Run bridge + system tray icon + http://localhost:9099 dashboard
+  esbm-bridge run                                  Start the bridge in the foreground (no tray)
   esbm-bridge install                              Install as a Windows service (admin)
   esbm-bridge uninstall                            Remove the Windows service (admin)
   esbm-bridge status                               Show paired state
@@ -196,9 +208,10 @@ func cmdSetup(log *slog.Logger, args []string) int {
 	fmt.Println("  Starting bridge — Ctrl+C to stop, or close this window.")
 	fmt.Println("============================================================")
 	fmt.Println()
-	// Delegate to the regular run path so we share startup, logging
-	// and shutdown semantics with the scripted invocation.
-	return cmdRun(log, nil)
+	// After a fresh pair, drop into tray mode so the operator sees a
+	// status icon + dashboard right away (the actual proxy work
+	// happens in the goroutine cmdTray spawns).
+	return cmdTray(log, nil)
 }
 
 // holdForEnter blocks until the operator presses Enter, used by the
@@ -288,7 +301,25 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	}
 	cfg.Defaults()
 
-	// Bring up Tailscale first — the proxy needs the Dialer.
+	// Dashboard fronts the status JSON + HTML on localhost. We expose
+	// it before anything else so even if Tailscale fails to start the
+	// operator can still see why.
+	dash := dashboard.New(dashboard.DefaultAddr, log)
+	dash.SetStatus(dashboard.Status{
+		Version:   version,
+		ShopCode:  cfg.ShopCode,
+		ServerAddr: cfg.ServerAddr,
+		StartedAt: time.Now(),
+	})
+
+	// Supervisor wraps each long-running goroutine with panic recovery
+	// and exponential-backoff restart. A failure in any one component
+	// no longer takes the whole Bridge down — the operator sees the
+	// "restarting" state in the tray + dashboard and the worker comes
+	// back on its own.
+	supDash := supervisor.Run(ctx, log, "dashboard", dash.Run)
+
+	// Bring up Tailscale next — the proxies need the Dialer.
 	t := &tunnel.Tunnel{
 		Hostname: cfg.Hostname,
 		AuthKey:  cfg.TailscaleAuthKey,
@@ -297,7 +328,13 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	}
 	if err := t.Start(ctx); err != nil {
 		log.Error("tailscale failed to start", "err", err)
-		return 1
+		// Don't return — keep the dashboard up so the operator can see
+		// the failure. The supervisor for the proxies will sit in
+		// "starting" forever, surfacing the issue in the UI.
+		dash.SetStatus(dashboard.Status{
+			Version: version, ShopCode: cfg.ShopCode, ServerAddr: cfg.ServerAddr,
+			TailscaleReady: false,
+		})
 	}
 	defer t.Close()
 
@@ -319,33 +356,87 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 		Dialer:   t,
 		Logger:   log,
 	}
+	sup9071 := supervisor.Run(ctx, log, "proxy:9071", srv9071.Run)
+	sup9080 := supervisor.Run(ctx, log, "proxy:9080", srv9080.Run)
 
-	// Heartbeats in parallel with both proxies. They share ctx so
-	// Ctrl-C cleanly shuts everything down.
+	// Heartbeats in parallel with the proxies. Same supervisor
+	// treatment — a transient network error during heartbeat shouldn't
+	// take the bridge process down.
 	cli := api.New(cfg.EsbmAppURL, cfg.BridgeJWT)
-	go heartbeatLoop(ctx, log, cli, srv9080, srv9071)
+	supHB := supervisor.Run(ctx, log, "heartbeat", func(ctx context.Context) error {
+		heartbeatLoop(ctx, log, cli, srv9080, srv9071)
+		return nil
+	})
+
+	// Status pump: every 2s, refresh the dashboard with current
+	// supervisor state. Cheap and gives the tray icon something live.
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				dash.SetStatus(dashboard.Status{
+					Version:   version,
+					ShopCode:  cfg.ShopCode,
+					ServerAddr: cfg.ServerAddr,
+					StartedAt: dash.Snapshot().StartedAt,
+					TailscaleHostname: cfg.Hostname,
+					TailscaleReady: t != nil,
+					Workers: []supervisor.Status{
+						supDash.Snapshot(),
+						sup9071.Snapshot(),
+						sup9080.Snapshot(),
+						supHB.Snapshot(),
+					},
+				})
+			}
+		}
+	}()
 
 	log.Info("bridge running", "shop_code", cfg.ShopCode, "version", version,
-		"listen", []string{"0.0.0.0:9071", "0.0.0.0:9080"})
+		"listen", []string{"0.0.0.0:9071", "0.0.0.0:9080"},
+		"dashboard", "http://"+dashboard.DefaultAddr)
 
-	// Run both proxies concurrently. Whichever returns first wins
-	// and we tear the other down. We use a derived cancellable ctx so
-	// we don't have to know whether the parent context came from
-	// signal.NotifyContext (CLI mode) or the SCM handler (service mode).
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-	errCh := make(chan error, 2)
-	go func() { errCh <- srv9071.Run(runCtx) }()
-	go func() { errCh <- srv9080.Run(runCtx) }()
-	err = <-errCh
-	cancelRun()
-	<-errCh // wait for the other goroutine to drain
-	if err != nil && !errors.Is(err, context.Canceled) {
-		log.Error("proxy stopped with error", "err", err)
-		return 1
-	}
+	<-ctx.Done()
 	log.Info("bridge stopped cleanly")
 	return 0
+}
+
+// cmdTray runs the bridge with a system tray icon + local dashboard.
+// Designed for the "I want to see what's happening" case — the
+// service install handles the unattended-restart case. Tray must
+// run on the GUI thread so we call it from main(); the actual work
+// runs in cmdRunCtx via a goroutine.
+func cmdTray(log *slog.Logger, _ []string) int {
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Run the bridge in a goroutine; the tray loop owns the main thread.
+	bridgeCtx, cancelBridge := context.WithCancel(ctx)
+	done := make(chan int, 1)
+	go func() { done <- cmdRunCtx(bridgeCtx, log) }()
+
+	// Tray must run synchronously on main. RunBridge returns when the
+	// user clicks Quit or systray itself receives a shutdown signal.
+	dash := dashboard.New(dashboard.DefaultAddr, log)
+	tray.RunBridge(ctx, log, version, dash, func() {
+		cancelBridge()
+		bridgeCtx, cancelBridge = context.WithCancel(ctx)
+		go func() { done <- cmdRunCtx(bridgeCtx, log) }()
+	})
+
+	cancelBridge()
+	select {
+	case rc := <-done:
+		return rc
+	case <-time.After(5 * time.Second):
+		log.Warn("bridge didn't shut down in 5s — forcing exit")
+		return 0
+	}
 }
 
 // dialAddr rewrites the upstream port — config.ServerAddr stores ONE
