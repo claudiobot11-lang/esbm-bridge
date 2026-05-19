@@ -9,6 +9,11 @@
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)
+# Windows builds use -H windowsgui so double-clicking the .exe from
+# Explorer doesn't pop a console window. CLI commands (install,
+# status, pair) still print to the operator's cmd.exe via
+# winconsole.AttachToParent().
+WIN_LDFLAGS := $(LDFLAGS) -H windowsgui
 
 .PHONY: build
 build:
@@ -16,12 +21,12 @@ build:
 
 .PHONY: windows
 windows:
-	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/esbm-bridge.exe ./cmd/bridge
+	GOOS=windows GOARCH=amd64 go build -ldflags "$(WIN_LDFLAGS)" -o bin/esbm-bridge.exe ./cmd/bridge
 
 .PHONY: release
 release: clean
 	mkdir -p dist
-	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS) -s -w" -o dist/esbm-bridge-windows-amd64.exe ./cmd/bridge
+	GOOS=windows GOARCH=amd64 go build -ldflags "$(WIN_LDFLAGS) -s -w" -o dist/esbm-bridge-windows-amd64.exe ./cmd/bridge
 	GOOS=linux   GOARCH=amd64 go build -ldflags "$(LDFLAGS) -s -w" -o dist/esbm-bridge-linux-amd64       ./cmd/bridge
 	GOOS=darwin  GOARCH=arm64 go build -ldflags "$(LDFLAGS) -s -w" -o dist/esbm-bridge-darwin-arm64      ./cmd/bridge
 

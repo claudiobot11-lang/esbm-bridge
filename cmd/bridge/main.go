@@ -35,7 +35,10 @@ import (
 	"github.com/claudiobot11-lang/esbm-bridge/internal/supervisor"
 	"github.com/claudiobot11-lang/esbm-bridge/internal/tray"
 	"github.com/claudiobot11-lang/esbm-bridge/internal/tunnel"
+	"github.com/claudiobot11-lang/esbm-bridge/internal/winconsole"
 	"github.com/claudiobot11-lang/esbm-bridge/internal/winservice"
+	"io"
+	"path/filepath"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=…"
@@ -43,7 +46,23 @@ import (
 var version = "dev"
 
 func main() {
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// The .exe is linked with -H windowsgui so double-clicking from
+	// Explorer doesn't pop a cmd.exe window. When the operator DID
+	// launch us from a terminal (running `esbm-bridge install` etc.)
+	// AttachToParent hijacks the parent's stdout/stderr so CLI output
+	// still appears as expected. Result: tray mode is GUI-only; CLI
+	// mode looks like every other command-line tool.
+	hasConsole := winconsole.AttachToParent()
+
+	// Logs always go to a file in %ProgramData% so we can debug
+	// crashes from a user session where the tray icon vanished
+	// silently. When attached to a terminal, mirror them there too.
+	logSinks := []io.Writer{openLogFile()}
+	if hasConsole {
+		logSinks = append(logSinks, os.Stderr)
+	}
+	log := slog.New(slog.NewTextHandler(io.MultiWriter(logSinks...),
+		&slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	// Windows-Service mode: when launched by SCM there's no controlling
 	// terminal, IsWindowsService() returns true, and we MUST call
@@ -437,6 +456,34 @@ func cmdTray(log *slog.Logger, _ []string) int {
 		log.Warn("bridge didn't shut down in 5s — forcing exit")
 		return 0
 	}
+}
+
+// openLogFile returns an append-mode handle to %ProgramData%\esbm-bridge\bridge.log
+// (or $HOME/.local/share/esbm-bridge/bridge.log on dev builds). Falls
+// back to io.Discard when neither path is writable so the process
+// can't fail to start just because of a logging issue. Rotation is
+// intentionally absent — the log volume is tiny (heartbeats + bind
+// events) and operators are expected to delete the file occasionally
+// if it grows past their comfort level.
+func openLogFile() io.Writer {
+	dir := ""
+	if pd := os.Getenv("ProgramData"); pd != "" {
+		dir = filepath.Join(pd, "esbm-bridge")
+	} else if hd, _ := os.UserHomeDir(); hd != "" {
+		dir = filepath.Join(hd, ".local", "share", "esbm-bridge")
+	}
+	if dir == "" {
+		return io.Discard
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return io.Discard
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "bridge.log"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return io.Discard
+	}
+	return f
 }
 
 // dialAddr rewrites the upstream port — config.ServerAddr stores ONE
