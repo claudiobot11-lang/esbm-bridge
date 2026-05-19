@@ -32,6 +32,7 @@ import (
 	"github.com/claudiobot11-lang/esbm-bridge/internal/config"
 	"github.com/claudiobot11-lang/esbm-bridge/internal/proxy"
 	"github.com/claudiobot11-lang/esbm-bridge/internal/tunnel"
+	"github.com/claudiobot11-lang/esbm-bridge/internal/winservice"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=…"
@@ -40,6 +41,20 @@ var version = "dev"
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Windows-Service mode: when launched by SCM there's no controlling
+	// terminal, IsWindowsService() returns true, and we MUST call
+	// svc.Run before anything else or SCM gives up after 30s and
+	// marks the service as failed. The svc handler calls cmdRunCtx
+	// which is the same work cmdRun does interactively — only the
+	// shutdown signal source differs (SCM Stop vs Ctrl-C).
+	if winservice.IsWindowsService() {
+		if err := winservice.Run(log, cmdRunCtx); err != nil {
+			log.Error("windows service exited with error", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// Default command for double-click from Windows Explorer: `setup`
 	// walks the operator from "I just downloaded an exe" all the way
@@ -61,6 +76,10 @@ func main() {
 		os.Exit(cmdPair(log, args))
 	case "run":
 		os.Exit(cmdRun(log, args))
+	case "install":
+		os.Exit(cmdInstall(log, args))
+	case "uninstall":
+		os.Exit(cmdUninstall(log, args))
 	case "status":
 		os.Exit(cmdStatus(log, args))
 	case "version", "-v", "--version":
@@ -79,13 +98,19 @@ func usage() {
 
 Usage:
   esbm-bridge setup                                Pair + start, interactive (the easy way)
-  esbm-bridge pair   --code CODE [--server URL]   Pair with esbm-app once (scripting)
-  esbm-bridge run                                  Start the bridge service
+  esbm-bridge pair      --code CODE [--server URL] Pair with esbm-app once (scripting)
+  esbm-bridge run                                  Start the bridge in the foreground
+  esbm-bridge install                              Install as a Windows service (admin)
+  esbm-bridge uninstall                            Remove the Windows service (admin)
   esbm-bridge status                               Show paired state
   esbm-bridge version                              Print version
 
 Pairing codes come from the esbm-app /esl/stores page.
-On Windows, double-click the .exe to launch ` + "`setup`" + ` interactively.
+Recommended flow on a store PC:
+  1. esbm-bridge pair --code CODE
+  2. (run cmd.exe as Administrator)  esbm-bridge install
+  → service starts now, auto-starts on every boot, restarts on crash,
+    and the Windows Firewall is opened for 9071 + 9080 automatically.
 `, version)
 }
 
@@ -245,6 +270,16 @@ func cmdStatus(_ *slog.Logger, _ []string) int {
 }
 
 func cmdRun(log *slog.Logger, _ []string) int {
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	return cmdRunCtx(ctx, log)
+}
+
+// cmdRunCtx is the cancellable variant of cmdRun — same logic, but the
+// caller supplies the lifetime context. Used by the Windows Service
+// handler, which gets its Stop signal from the SCM rather than SIGINT.
+func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Error("not paired", "err", err)
@@ -252,10 +287,6 @@ func cmdRun(log *slog.Logger, _ []string) int {
 		return 1
 	}
 	cfg.Defaults()
-
-	ctx, cancel := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	// Bring up Tailscale first — the proxy needs the Dialer.
 	t := &tunnel.Tunnel{
@@ -298,12 +329,16 @@ func cmdRun(log *slog.Logger, _ []string) int {
 		"listen", []string{"0.0.0.0:9071", "0.0.0.0:9080"})
 
 	// Run both proxies concurrently. Whichever returns first wins
-	// and we tear the other down via ctx cancellation.
+	// and we tear the other down. We use a derived cancellable ctx so
+	// we don't have to know whether the parent context came from
+	// signal.NotifyContext (CLI mode) or the SCM handler (service mode).
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 	errCh := make(chan error, 2)
-	go func() { errCh <- srv9071.Run(ctx) }()
-	go func() { errCh <- srv9080.Run(ctx) }()
+	go func() { errCh <- srv9071.Run(runCtx) }()
+	go func() { errCh <- srv9080.Run(runCtx) }()
 	err = <-errCh
-	cancel()
+	cancelRun()
 	<-errCh // wait for the other goroutine to drain
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("proxy stopped with error", "err", err)
