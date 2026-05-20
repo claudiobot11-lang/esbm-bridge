@@ -86,15 +86,19 @@ func main() {
 	//     touching cmd.exe.
 	// From a real terminal we still want help() on bare invocation.
 	if len(os.Args) < 2 {
-		if launchedFromExplorer() {
-			// No console here (windowsgui) — drive setup entirely through
-			// native dialogs so the operator never touches cmd.exe.
-			// cmdSetupGUI handles both cases: paired → tray, else GUI pair
-			// + self-elevating install.
-			os.Exit(cmdSetupGUI(log))
+		// No subcommand. Decide by whether we have a console:
+		//   - has console  → launched from a terminal → print usage.
+		//   - no console   → double-clicked (windowsgui has no console)
+		//                    → GUI setup, all via native dialogs, no cmd.
+		// (We can't use GetConsoleProcessList/launchedFromExplorer here:
+		// a -H windowsgui binary has NO console on double-click, so that
+		// check always returned false and the GUI was never reached —
+		// the "nothing happens" bug. hasConsole is reliable.)
+		if hasConsole {
+			usage()
+			os.Exit(2)
 		}
-		usage()
-		os.Exit(2)
+		os.Exit(cmdSetupGUI(log))
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 
