@@ -152,7 +152,7 @@ Recommended flow on a store PC:
 func cmdSetup(log *slog.Logger, args []string) int {
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
 	codeFlag := fs.String("code", "", "skip the prompt and use this pairing code")
-	server := fs.String("server", "https://esbm-app-production.up.railway.app",
+	server := fs.String("server", "https://app.estacionsanbrunomarket.com",
 		"esbm-app base URL (override only for staging/dev)")
 	_ = fs.Parse(args)
 
@@ -245,7 +245,7 @@ func holdForEnter(r *bufio.Reader) {
 func cmdPair(log *slog.Logger, args []string) int {
 	fs := flag.NewFlagSet("pair", flag.ExitOnError)
 	code := fs.String("code", "", "6-digit pairing code from /esl/stores (required)")
-	server := fs.String("server", "https://esbm-app-production.up.railway.app",
+	server := fs.String("server", "https://app.estacionsanbrunomarket.com",
 		"esbm-app base URL (override only for staging/dev)")
 	_ = fs.Parse(args)
 
@@ -338,23 +338,19 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	// back on its own.
 	supDash := supervisor.Run(ctx, log, "dashboard", dash.Run)
 
-	// Bring up Tailscale next — the proxies need the Dialer.
+	// Bring up Tailscale next — the proxies need the Dialer. SUPERVISED
+	// + health-checked (see tunnel.go): if the tunnel wedges into a
+	// one-way / dead state, t.Run returns an error and the supervisor
+	// rebuilds tsnet from scratch — auto-reconnect. HealthAddr probes
+	// the cloud Cronus port (9071) through the VPN every 30s.
 	t := &tunnel.Tunnel{
-		Hostname: cfg.Hostname,
-		AuthKey:  cfg.TailscaleAuthKey,
-		StateDir: cfg.TailscaleStateDir,
-		Logger:   log,
+		Hostname:   cfg.Hostname,
+		AuthKey:    cfg.TailscaleAuthKey,
+		StateDir:   cfg.TailscaleStateDir,
+		Logger:     log,
+		HealthAddr: dialAddr(cfg.ServerAddr, 9071),
 	}
-	if err := t.Start(ctx); err != nil {
-		log.Error("tailscale failed to start", "err", err)
-		// Don't return — keep the dashboard up so the operator can see
-		// the failure. The supervisor for the proxies will sit in
-		// "starting" forever, surfacing the issue in the UI.
-		dash.SetStatus(dashboard.Status{
-			Version: version, ShopCode: cfg.ShopCode, ServerAddr: cfg.ServerAddr,
-			TailscaleReady: false,
-		})
-	}
+	supTunnel := supervisor.Run(ctx, log, "tunnel", t.Run)
 	defer t.Close()
 
 	// Local listeners for the gateway. Two ports because eRetail's
@@ -403,9 +399,10 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 					ServerAddr: cfg.ServerAddr,
 					StartedAt: dash.Snapshot().StartedAt,
 					TailscaleHostname: cfg.Hostname,
-					TailscaleReady: t != nil,
+					TailscaleReady: t.Ready(),
 					Workers: []supervisor.Status{
 						supDash.Snapshot(),
+						supTunnel.Snapshot(),
 						sup9071.Snapshot(),
 						sup9080.Snapshot(),
 						supHB.Snapshot(),
