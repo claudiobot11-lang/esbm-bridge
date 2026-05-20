@@ -87,10 +87,11 @@ func main() {
 	// From a real terminal we still want help() on bare invocation.
 	if len(os.Args) < 2 {
 		if launchedFromExplorer() {
-			if _, err := config.Load(); err == nil {
-				os.Exit(cmdTray(log, nil))
-			}
-			os.Exit(cmdSetup(log, nil))
+			// No console here (windowsgui) — drive setup entirely through
+			// native dialogs so the operator never touches cmd.exe.
+			// cmdSetupGUI handles both cases: paired → tray, else GUI pair
+			// + self-elevating install.
+			os.Exit(cmdSetupGUI(log))
 		}
 		usage()
 		os.Exit(2)

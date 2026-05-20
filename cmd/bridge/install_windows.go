@@ -36,6 +36,18 @@ var firewallRules = []struct {
 }
 
 func cmdInstall(log *slog.Logger, _ []string) int {
+	// 0. Self-elevate so the operator never needs an admin cmd.exe. If
+	//    we're not already elevated, re-launch ourselves with a UAC
+	//    prompt and let the elevated copy do the install.
+	if !isElevated() {
+		log.Info("not elevated — requesting admin via UAC")
+		if err := relaunchElevated("install"); err != nil {
+			log.Error("UAC elevation declined or failed", "err", err)
+			return 1
+		}
+		return 0
+	}
+
 	// 1. Resolve the absolute path of the .exe so the service registers
 	//    a stable BinaryPathName. SCM stores the literal path — if the
 	//    operator moved the exe later the service would fail to start.
