@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // Config is the on-disk Bridge state. Written once at `pair`, read on
@@ -113,6 +114,10 @@ func Load() (*Config, error) {
 	if c.BridgeJWT == "" {
 		return nil, errors.New("config file present but missing bridge_jwt — re-pair")
 	}
+	// Apply defaults/migrations on every load, not just at pair time: an
+	// install from before the Hetzner move still carries the dead Railway
+	// host on disk, and without this it would keep talking to nothing.
+	c.Defaults()
 	return &c, nil
 }
 
@@ -135,9 +140,20 @@ func (c *Config) Save() error {
 }
 
 // Defaults fills in derived fields the pairing handshake didn't set.
+// DefaultEsbmAppURL is where esbm-app actually lives. It moved off
+// Railway to the Hetzner box in 2026-05; the old Railway host is GONE and
+// answers every request with {"message":"Application not found"}. Pointing
+// here by default (and migrating configs that still carry the dead host —
+// see Defaults) keeps a bridge from silently talking to nothing.
+const DefaultEsbmAppURL = "https://app.estacionsanbrunomarket.com"
+
 func (c *Config) Defaults() {
 	if c.EsbmAppURL == "" {
-		c.EsbmAppURL = "https://esbm-app-production.up.railway.app"
+		c.EsbmAppURL = DefaultEsbmAppURL
+	}
+	// Self-heal installs still pinned to the decommissioned Railway host.
+	if strings.Contains(c.EsbmAppURL, "railway.app") {
+		c.EsbmAppURL = DefaultEsbmAppURL
 	}
 	if c.Hostname == "" && c.ShopCode != "" {
 		c.Hostname = "bridge-" + sanitize(c.ShopCode)
