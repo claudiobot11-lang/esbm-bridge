@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,8 +42,40 @@ type Tunnel struct {
 	// eRetail Cronus port). Empty disables active probing.
 	HealthAddr string
 
+	// KeyFunc fetches a FRESH Tailscale auth key from the cloud. Called
+	// only when Up() is rejected for auth — see start(). Without it a
+	// dead key wedges the tunnel forever: on 2026-09-09 an expired
+	// ephemeral key took the store's 647 tags offline for two days while
+	// the supervisor retried the same dead key 1538 times.
+	KeyFunc func(context.Context) (string, error)
+
+	// OnNewKey is called after KeyFunc yields a working key so the caller
+	// can persist it (config.json) and survive a restart.
+	OnNewKey func(string)
+
 	mu  sync.RWMutex
 	srv *tsnet.Server
+	up  bool // true only AFTER Up() succeeded — see Ready()
+}
+
+// isAuthFailure reports whether a tsnet error means our auth key was
+// rejected (expired, revoked, or deleted from the tailnet) rather than a
+// transient network problem. Observed string: "tsnet up: tsnet:Up:
+// backend: invalid key: API key does not exist".
+func isAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"invalid key", "api key does not exist", "unauthorized",
+		"invalid auth", "key expired", "expired", "needs login", "logged out",
+	} {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // start (re)creates the tsnet server and blocks until it's online.
@@ -49,15 +83,21 @@ type Tunnel struct {
 // half-dead node. tsnet reuses the node identity stored in StateDir, so
 // re-Up after the first pairing doesn't need the auth key to be valid
 // again.
-func (t *Tunnel) start(ctx context.Context) error {
+// bringUp (re)creates the tsnet server with the given key and blocks
+// until it's online. `up` is only set true AFTER Up() returns — the old
+// code marked the tunnel ready the moment the struct existed, so the
+// dashboard and the cloud heartbeat both reported a healthy tunnel while
+// it was in fact dead.
+func (t *Tunnel) bringUp(ctx context.Context, key string) error {
 	t.mu.Lock()
 	if t.srv != nil {
 		_ = t.srv.Close()
 		t.srv = nil
 	}
+	t.up = false
 	srv := &tsnet.Server{
 		Hostname: t.Hostname,
-		AuthKey:  t.AuthKey,
+		AuthKey:  key,
 		Dir:      t.StateDir,
 		// Silence tsnet's stdout chatter; pipe structured logs via slog.
 		Logf: func(format string, args ...any) {
@@ -74,10 +114,55 @@ func (t *Tunnel) start(ctx context.Context) error {
 	if _, err := srv.Up(ctx); err != nil {
 		return fmt.Errorf("tsnet up: %w", err)
 	}
+	t.mu.Lock()
+	t.up = true
+	t.mu.Unlock()
 	if t.Logger != nil {
 		t.Logger.Info("tailscale up", "hostname", t.Hostname)
 	}
 	return nil
+}
+
+// start brings the tunnel up, and — this is the 2026-09 fix — recovers
+// when the auth key itself is dead instead of retrying it forever.
+// Escalation: fresh key from the cloud → if still rejected, wipe the
+// stale node identity and register clean.
+func (t *Tunnel) start(ctx context.Context) error {
+	err := t.bringUp(ctx, t.AuthKey)
+	if err == nil || !isAuthFailure(err) || t.KeyFunc == nil {
+		return err
+	}
+
+	if t.Logger != nil {
+		t.Logger.Warn("tailscale auth rejected — fetching a fresh key", "err", err)
+	}
+	key, kerr := t.KeyFunc(ctx)
+	if kerr != nil {
+		return fmt.Errorf("%w (fresh key fetch failed: %v)", err, kerr)
+	}
+	if key == "" || key == t.AuthKey {
+		return fmt.Errorf("%w (cloud has no newer key)", err)
+	}
+	t.AuthKey = key
+	if t.OnNewKey != nil {
+		t.OnNewKey(key)
+	}
+
+	err2 := t.bringUp(ctx, key)
+	if err2 == nil || !isAuthFailure(err2) {
+		return err2
+	}
+
+	// Still rejected: the node identity cached in StateDir is stale —
+	// exactly what happens when an EPHEMERAL node gets deleted after the
+	// bridge goes offline. Wipe it so tsnet registers as a new node.
+	if t.StateDir != "" {
+		if t.Logger != nil {
+			t.Logger.Warn("resetting tailscale state for clean re-registration", "dir", t.StateDir)
+		}
+		_ = os.RemoveAll(t.StateDir)
+	}
+	return t.bringUp(ctx, key)
 }
 
 // Run is the supervised worker: bring the tunnel up, then health-check
@@ -157,12 +242,13 @@ func (t *Tunnel) DialContext(ctx context.Context, network, address string) (net.
 	return srv.Dial(ctx, network, address)
 }
 
-// Ready reports whether the tunnel currently has a live tsnet server.
-// Used by the dashboard/status pump.
+// Ready reports whether the tunnel is actually UP — not merely
+// constructed. Both the dashboard and the cloud heartbeat read this, so
+// it must never claim health the tunnel doesn't have.
 func (t *Tunnel) Ready() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.srv != nil
+	return t.srv != nil && t.up
 }
 
 // Close cleanly shuts down the tsnet node. Important before process
@@ -170,6 +256,7 @@ func (t *Tunnel) Ready() bool {
 func (t *Tunnel) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.up = false
 	if t.srv == nil {
 		return nil
 	}

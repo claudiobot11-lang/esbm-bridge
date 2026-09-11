@@ -343,6 +343,10 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	// back on its own.
 	supDash := supervisor.Run(ctx, log, "dashboard", dash.Run)
 
+	// Cloud client first — the tunnel needs it to pull a fresh Tailscale
+	// key if its own has expired (see KeyFunc below).
+	cli := api.New(cfg.EsbmAppURL, cfg.BridgeJWT)
+
 	// Bring up Tailscale next — the proxies need the Dialer. SUPERVISED
 	// + health-checked (see tunnel.go): if the tunnel wedges into a
 	// one-way / dead state, t.Run returns an error and the supervisor
@@ -354,6 +358,28 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 		StateDir:   cfg.TailscaleStateDir,
 		Logger:     log,
 		HealthAddr: dialAddr(cfg.ServerAddr, 9071),
+		// Self-heal a dead auth key instead of retrying it forever: pull
+		// the current one from esbm-app (we're already authenticated with
+		// the bridge JWT) and persist it so a restart keeps working.
+		KeyFunc: func(ctx context.Context) (string, error) {
+			c, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			return cli.FetchTSKey(c)
+		},
+		OnNewKey: func(k string) {
+			cfg.TailscaleAuthKey = k
+			if err := cfg.Save(); err != nil {
+				log.Warn("could not persist refreshed tailscale key", "err", err)
+			} else {
+				log.Info("refreshed tailscale auth key from cloud")
+			}
+			cc, ccancel := context.WithTimeout(ctx, 15*time.Second)
+			defer ccancel()
+			_ = cli.SendEvent(cc, api.Event{
+				Type: "tailscale_key_refreshed", Severity: "warn",
+				Message: "auth key was rejected; pulled a fresh one from esbm-app",
+			})
+		},
 	}
 	supTunnel := supervisor.Run(ctx, log, "tunnel", t.Run)
 	defer t.Close()
@@ -382,9 +408,8 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	// Heartbeats in parallel with the proxies. Same supervisor
 	// treatment — a transient network error during heartbeat shouldn't
 	// take the bridge process down.
-	cli := api.New(cfg.EsbmAppURL, cfg.BridgeJWT)
 	supHB := supervisor.Run(ctx, log, "heartbeat", func(ctx context.Context) error {
-		heartbeatLoop(ctx, log, cli, srv9080, srv9071)
+		heartbeatLoop(ctx, log, cli, t, srv9080, srv9071)
 		return nil
 	})
 
@@ -511,7 +536,13 @@ func indexLastColon(s string) int {
 // heartbeatLoop fires once at startup so the dashboard flips to
 // green immediately, then every 60s. Failures are logged but never
 // kill the proxy — the gateway → cloud path is what matters.
-func heartbeatLoop(ctx context.Context, log *slog.Logger, cli *api.Client, servers ...*proxy.Server) {
+// tunnelState is whatever can report the live tunnel health (i.e.
+// *tunnel.Tunnel). Injected so the heartbeat reports the TRUTH instead
+// of the hardcoded `TailscaleOK: true` it used to send — that lie is why
+// a two-day outage looked perfectly healthy in the cloud dashboard.
+type tunnelState interface{ Ready() bool }
+
+func heartbeatLoop(ctx context.Context, log *slog.Logger, cli *api.Client, tun tunnelState, servers ...*proxy.Server) {
 	start := time.Now()
 	tick := time.NewTicker(60 * time.Second)
 	defer tick.Stop()
@@ -526,14 +557,23 @@ func heartbeatLoop(ctx context.Context, log *slog.Logger, cli *api.Client, serve
 		for _, s := range servers {
 			msgs += s.MsgsLastMin()
 		}
+		tsOK := tun == nil || tun.Ready()
 		err := cli.SendHeartbeat(c, api.Heartbeat{
 			UptimeSec:       int64(time.Since(start).Seconds()),
 			Version:         version,
 			MQTTMsgsLastMin: msgs,
-			TailscaleOK:     true,
+			TailscaleOK:     tsOK,
 		})
 		if err != nil {
 			log.Warn("heartbeat failed", "err", err)
+		}
+		// Make a down tunnel LOUD: an event lands on the bridge record in
+		// esbm-app, so the outage is visible in minutes instead of days.
+		if !tsOK {
+			_ = cli.SendEvent(c, api.Event{
+				Type: "tunnel_down", Severity: "error",
+				Message: "tailscale tunnel is not up — gateway traffic cannot reach the cloud",
+			})
 		}
 	}
 	send() // first beat — populate the dashboard ASAP

@@ -108,6 +108,21 @@ func (c *Client) SendEvent(ctx context.Context, ev Event) error {
 	return c.postJSON(ctx, "/api/esl/bridge/event", ev, nil)
 }
 
+// FetchTSKey asks esbm-app for the CURRENT Tailscale auth key. Used to
+// self-heal when the key baked into config.json at pair time has expired
+// or been revoked — the failure that took the store offline for two days
+// in 2026-09. Authenticated with the bridge JWT we already hold, so the
+// operator never has to touch config.json by hand.
+func (c *Client) FetchTSKey(ctx context.Context) (string, error) {
+	var out struct {
+		TailscaleAuthKey string `json:"ts_auth_key"`
+	}
+	if err := c.getJSON(ctx, "/api/esl/bridge/ts-key", &out); err != nil {
+		return "", err
+	}
+	return out.TailscaleAuthKey, nil
+}
+
 // PendingCommand is the polled-action shape. Bridge polls every
 // ~10s and runs whatever is queued (restart, diagnostic bundle, etc.).
 type PendingCommand struct {
