@@ -347,6 +347,45 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	// key if its own has expired (see KeyFunc below).
 	cli := api.New(cfg.EsbmAppURL, cfg.BridgeJWT)
 
+	// Ask the cloud where things are BEFORE building anything that dials
+	// it. config.json holds whatever was true at pair time, which can be
+	// months old: see FetchCloudConfig for the 20-hour outage this
+	// prevents. Best-effort on purpose — if the cloud is unreachable we
+	// carry on with the stored values rather than refusing to start.
+	func() {
+		c, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		key, addr, err := cli.FetchCloudConfig(c)
+		if err != nil {
+			log.Warn("could not refresh cloud config at startup; using stored values", "err", err)
+			return
+		}
+		changed := false
+		if addr != "" && addr != cfg.ServerAddr {
+			log.Info("eRetail address changed in cloud", "old", cfg.ServerAddr, "new", addr)
+			cfg.ServerAddr = addr
+			changed = true
+		}
+		if key != "" && key != cfg.TailscaleAuthKey {
+			log.Info("tailscale auth key changed in cloud")
+			cfg.TailscaleAuthKey = key
+			changed = true
+		}
+		if !changed {
+			return
+		}
+		if err := cfg.Save(); err != nil {
+			log.Warn("could not persist refreshed cloud config", "err", err)
+			return
+		}
+		dash.SetStatus(dashboard.Status{
+			Version:    version,
+			ShopCode:   cfg.ShopCode,
+			ServerAddr: cfg.ServerAddr,
+			StartedAt:  time.Now(),
+		})
+	}()
+
 	// Bring up Tailscale next — the proxies need the Dialer. SUPERVISED
 	// + health-checked (see tunnel.go): if the tunnel wedges into a
 	// one-way / dead state, t.Run returns an error and the supervisor

@@ -114,13 +114,29 @@ func (c *Client) SendEvent(ctx context.Context, ev Event) error {
 // in 2026-09. Authenticated with the bridge JWT we already hold, so the
 // operator never has to touch config.json by hand.
 func (c *Client) FetchTSKey(ctx context.Context) (string, error) {
+	k, _, err := c.FetchCloudConfig(ctx)
+	return k, err
+}
+
+// FetchCloudConfig pulls BOTH values the Bridge cannot fix by itself:
+// the current Tailscale auth key and the current eRetail MQTT address.
+//
+// The address matters as much as the key. It was handed over once, at
+// pair time, and nothing could correct it afterwards. On 2026-11-13 the
+// cloud node's Tailscale key expired; the box rejoined the tailnet with
+// a DIFFERENT IP, and both bridges went on probing the old one
+// ("tunnel unhealthy: 3 consecutive probe failures to 100.108.175.3:9071")
+// while the store's 648 tags sat frozen for 20 hours. Tailscale was
+// "connected" the whole time, which is why it took so long to see.
+func (c *Client) FetchCloudConfig(ctx context.Context) (key, serverAddr string, err error) {
 	var out struct {
 		TailscaleAuthKey string `json:"ts_auth_key"`
+		ServerAddr       string `json:"server_addr"`
 	}
 	if err := c.getJSON(ctx, "/api/esl/bridge/ts-key", &out); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return out.TailscaleAuthKey, nil
+	return out.TailscaleAuthKey, out.ServerAddr, nil
 }
 
 // PendingCommand is the polled-action shape. Bridge polls every
