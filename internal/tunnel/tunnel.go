@@ -42,6 +42,20 @@ type Tunnel struct {
 	// eRetail Cronus port). Empty disables active probing.
 	HealthAddr string
 
+	// HealthAddrFunc, when set, supplies the probe target on EVERY probe
+	// and wins over HealthAddr. The cloud's tailnet address is not a
+	// constant: on 2026-11-13 the eRetail node re-registered with a new
+	// 100.x IP and a Bridge that had read the old one at startup probed a
+	// dead address for 20 hours. A func lets the caller swap the address
+	// under a running tunnel.
+	HealthAddrFunc func() string
+
+	// OnUnhealthy runs after every failed probe, before the tunnel
+	// decides whether to give up. The caller uses it to re-ask the cloud
+	// where eRetail lives, so a moved address is picked up within one
+	// probe interval instead of never.
+	OnUnhealthy func(context.Context)
+
 	// KeyFunc fetches a FRESH Tailscale auth key from the cloud. Called
 	// only when Up() is rejected for auth — see start(). Without it a
 	// dead key wedges the tunnel forever: on 2026-09-09 an expired
@@ -56,6 +70,21 @@ type Tunnel struct {
 	mu  sync.RWMutex
 	srv *tsnet.Server
 	up  bool // true only AFTER Up() succeeded — see Ready()
+
+	// probeFails counts consecutive failed health probes; probedOK is
+	// set once a probe has actually reached the cloud since the last
+	// bringUp. Together they separate "tsnet says online" from "we can
+	// reach eRetail", which Ready() alone never could.
+	probeFails int
+	probedOK   bool
+}
+
+// healthAddr resolves the current probe target.
+func (t *Tunnel) healthAddr() string {
+	if t.HealthAddrFunc != nil {
+		return t.HealthAddrFunc()
+	}
+	return t.HealthAddr
 }
 
 // isAuthFailure reports whether a tsnet error means our auth key was
@@ -91,10 +120,12 @@ func isAuthFailure(err error) bool {
 func (t *Tunnel) bringUp(ctx context.Context, key string) error {
 	t.mu.Lock()
 	if t.srv != nil {
-		_ = t.srv.Close()
+		closeServer(t.srv)
 		t.srv = nil
 	}
 	t.up = false
+	t.probeFails = 0
+	t.probedOK = false
 	srv := &tsnet.Server{
 		Hostname: t.Hostname,
 		AuthKey:  key,
@@ -140,26 +171,40 @@ func (t *Tunnel) start(ctx context.Context) error {
 	if kerr != nil {
 		return fmt.Errorf("%w (fresh key fetch failed: %v)", err, kerr)
 	}
-	if key == "" || key == t.AuthKey {
-		return fmt.Errorf("%w (cloud has no newer key)", err)
+	if key == "" {
+		return fmt.Errorf("%w (cloud has no key to offer)", err)
 	}
-	t.AuthKey = key
-	if t.OnNewKey != nil {
-		t.OnNewKey(key)
+	if key != t.AuthKey {
+		t.AuthKey = key
+		if t.OnNewKey != nil {
+			t.OnNewKey(key)
+		}
+		err2 := t.bringUp(ctx, key)
+		if err2 == nil || !isAuthFailure(err2) {
+			return err2
+		}
 	}
 
-	err2 := t.bringUp(ctx, key)
-	if err2 == nil || !isAuthFailure(err2) {
-		return err2
-	}
-
-	// Still rejected: the node identity cached in StateDir is stale —
-	// exactly what happens when an EPHEMERAL node gets deleted after the
-	// bridge goes offline. Wipe it so tsnet registers as a new node.
+	// Rejected with the key the cloud considers current — either a fresh
+	// one that still failed, or the SAME one we already had. The second
+	// case used to return "cloud has no newer key" and retry forever;
+	// but when the key is good and auth still fails, what is stale is
+	// the node identity cached in StateDir: exactly what happens when an
+	// EPHEMERAL node is deleted after the bridge has been offline for a
+	// while. Wipe it so tsnet registers as a new node. If the key really
+	// is dead this changes nothing — there was no working identity left
+	// to lose.
 	if t.StateDir != "" {
 		if t.Logger != nil {
 			t.Logger.Warn("resetting tailscale state for clean re-registration", "dir", t.StateDir)
 		}
+		t.mu.Lock()
+		if t.srv != nil {
+			closeServer(t.srv) // release the state files before deleting them
+			t.srv = nil
+		}
+		t.up = false
+		t.mu.Unlock()
 		_ = os.RemoveAll(t.StateDir)
 	}
 	return t.bringUp(ctx, key)
@@ -183,40 +228,70 @@ func (t *Tunnel) Run(ctx context.Context) error {
 	)
 	// No probe target → trust tsnet's own DERP self-healing and just
 	// block until shutdown.
-	if t.HealthAddr == "" {
+	if t.healthAddr() == "" {
 		<-ctx.Done()
 		return nil
 	}
 
+	// probe dials the cloud once through the tunnel. It returns an error
+	// only when the failure streak hits failLimit — that error is what
+	// makes the supervisor tear tsnet down and rebuild it.
+	probe := func() error {
+		addr := t.healthAddr()
+		c, cancel := context.WithTimeout(ctx, dialTO)
+		conn, err := t.DialContext(c, "tcp", addr)
+		cancel()
+		if ctx.Err() != nil {
+			return nil // shutting down — not a health signal
+		}
+		if err != nil {
+			t.mu.Lock()
+			t.probeFails++
+			fails := t.probeFails
+			t.mu.Unlock()
+			if t.Logger != nil {
+				t.Logger.Warn("tunnel health check failed",
+					"addr", addr, "err", err, "fails", fails)
+			}
+			if t.OnUnhealthy != nil {
+				t.OnUnhealthy(ctx)
+			}
+			if fails >= failLimit {
+				// Surface as an error → supervisor tears us down and
+				// calls Run again → start() rebuilds tsnet → reconnect.
+				return fmt.Errorf("tunnel unhealthy: %d consecutive probe failures to %s",
+					fails, addr)
+			}
+			return nil
+		}
+		_ = conn.Close()
+		t.mu.Lock()
+		had := t.probeFails
+		t.probeFails = 0
+		t.probedOK = true
+		t.mu.Unlock()
+		if had > 0 && t.Logger != nil {
+			t.Logger.Info("tunnel health recovered", "addr", addr)
+		}
+		return nil
+	}
+
+	// Probe once right away instead of waiting a full interval: "tsnet
+	// is up" and "eRetail is reachable" are different facts, and the
+	// installer and the dashboard need the second one within seconds.
+	if err := probe(); err != nil {
+		return err
+	}
+
 	ticker := time.NewTicker(checkEvery)
 	defer ticker.Stop()
-	fails := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			c, cancel := context.WithTimeout(ctx, dialTO)
-			conn, err := t.DialContext(c, "tcp", t.HealthAddr)
-			cancel()
-			if err != nil {
-				fails++
-				if t.Logger != nil {
-					t.Logger.Warn("tunnel health check failed",
-						"addr", t.HealthAddr, "err", err, "fails", fails)
-				}
-				if fails >= failLimit {
-					// Surface as an error → supervisor tears us down and
-					// calls Run again → start() rebuilds tsnet → reconnect.
-					return fmt.Errorf("tunnel unhealthy: %d consecutive probe failures to %s",
-						fails, t.HealthAddr)
-				}
-			} else {
-				_ = conn.Close()
-				if fails > 0 && t.Logger != nil {
-					t.Logger.Info("tunnel health recovered", "addr", t.HealthAddr)
-				}
-				fails = 0
+			if err := probe(); err != nil {
+				return err
 			}
 		}
 	}
@@ -243,12 +318,50 @@ func (t *Tunnel) DialContext(ctx context.Context, network, address string) (net.
 }
 
 // Ready reports whether the tunnel is actually UP — not merely
-// constructed. Both the dashboard and the cloud heartbeat read this, so
-// it must never claim health the tunnel doesn't have.
+// constructed. It says tsnet is online; it does NOT say the cloud is
+// reachable through it (see Healthy and Reachable).
 func (t *Tunnel) Ready() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.srv != nil && t.up
+}
+
+// Healthy is what the cloud heartbeat should report: tsnet is up AND we
+// are not in a run of failed probes. A single failed probe is tolerated
+// so one dropped packet does not page anyone; two in a row (a minute)
+// is an outage. Before this, the heartbeat said "tailscale ok" for the
+// whole of a 20-hour outage because tsnet itself was perfectly online
+// — it was just dialing an address that no longer existed.
+func (t *Tunnel) Healthy() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.srv == nil || !t.up {
+		return false
+	}
+	if t.HealthAddrFunc == nil && t.HealthAddr == "" {
+		return true // probing disabled: same rule as Reachable()
+	}
+	// probedOK matters: every rebuild resets the failure count, so
+	// without it a tunnel that is up but cannot reach eRetail reads as
+	// healthy again for ~45s after each rebuild — and more than half the
+	// heartbeats of a sustained outage would say "ok".
+	return t.probedOK && t.probeFails < 2
+}
+
+// Reachable is the strict, proven form: at least one probe has reached
+// the cloud since the tunnel last came up, and none is failing now.
+// The installer waits on this before telling the operator it worked.
+// With probing disabled it degrades to Ready().
+func (t *Tunnel) Reachable() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.srv == nil || !t.up {
+		return false
+	}
+	if t.HealthAddrFunc == nil && t.HealthAddr == "" {
+		return true
+	}
+	return t.probedOK && t.probeFails == 0
 }
 
 // Close cleanly shuts down the tsnet node. Important before process
@@ -257,10 +370,21 @@ func (t *Tunnel) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.up = false
-	if t.srv == nil {
-		return nil
-	}
-	err := t.srv.Close()
+	closeServer(t.srv)
 	t.srv = nil
-	return err
+	return nil
+}
+
+// closeServer closes a tsnet server without ever panicking. tsnet's
+// Close dereferences internal state that is nil when Start failed early
+// (e.g. the state dir could not be created) or never ran. Every caller
+// holds t.mu: a panic there is recovered by the supervisor with the
+// mutex still locked, which wedges every later dial, probe and
+// heartbeat while the process — and the Windows service — look alive.
+func closeServer(s *tsnet.Server) {
+	if s == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	_ = s.Close()
 }

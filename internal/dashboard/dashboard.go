@@ -23,16 +23,23 @@ const DefaultAddr = "127.0.0.1:9099"
 // Status is the snapshot the dashboard renders. The Bridge fills this
 // in via Server.SetStatus on every heartbeat tick.
 type Status struct {
-	Version           string                    `json:"version"`
-	ShopCode          string                    `json:"shop_code"`
-	ServerAddr        string                    `json:"server_addr"`
-	StartedAt         time.Time                 `json:"started_at"`
-	TailscaleHostname string                    `json:"tailscale_hostname"`
-	TailscaleReady    bool                      `json:"tailscale_ready"`
-	GatewayLastSeen   time.Time                 `json:"gateway_last_seen,omitempty"`
-	MQTTMessages      int64                     `json:"mqtt_messages"`
-	Workers           []supervisor.Status       `json:"workers"`
-	RecentLogs        []string                  `json:"recent_logs,omitempty"`
+	Version           string    `json:"version"`
+	ShopCode          string    `json:"shop_code"`
+	ServerAddr        string    `json:"server_addr"`
+	StartedAt         time.Time `json:"started_at"`
+	TailscaleHostname string    `json:"tailscale_hostname"`
+	TailscaleReady    bool      `json:"tailscale_ready"`
+	// CloudReachable is the proven form of TailscaleReady: a health
+	// probe has actually reached eRetail through the tunnel and none is
+	// failing now. tsnet being "up" is not the same thing.
+	CloudReachable bool `json:"cloud_reachable"`
+	// PID lets the installer confirm that the Bridge answering on this
+	// port is the service it just started, not a survivor.
+	PID             int                 `json:"pid"`
+	GatewayLastSeen time.Time           `json:"gateway_last_seen,omitempty"`
+	MQTTMessages    int64               `json:"mqtt_messages"`
+	Workers         []supervisor.Status `json:"workers"`
+	RecentLogs      []string            `json:"recent_logs,omitempty"`
 }
 
 // Server is the dashboard HTTP server. Construct with New, call

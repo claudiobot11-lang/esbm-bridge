@@ -1,21 +1,24 @@
-// cmdInstall / cmdUninstall — install the Bridge as a native Windows
-// service so it auto-starts on boot, restarts on crash, and survives
-// user logouts. Also installs Windows Firewall rules so the in-store
-// gateway can reach 9071/9080 from the LAN.
+// registerService / cmdUninstall — the Windows service plumbing: the
+// Bridge auto-starts on boot, restarts on crash, and survives user
+// logouts. Also installs Windows Firewall rules so the in-store gateway
+// can reach 9071/9080 from the LAN.
 //
-// All operations require admin rights — the user gets a UAC prompt
-// when they run `esbm-bridge install` from a normal cmd window.
+// `esbm-bridge install` no longer lands here directly: it runs cmdFix
+// (heal_windows.go), which closes every stale Bridge first and then
+// calls registerService. All of it needs admin; cmdFix self-elevates.
 //
 //go:build windows
 
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
-	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/claudiobot11-lang/esbm-bridge/internal/winservice"
@@ -35,55 +38,30 @@ var firewallRules = []struct {
 	{"ESBM Bridge — eStation (TCP 9080)", 9080},
 }
 
-func cmdInstall(log *slog.Logger, _ []string) int {
-	// 0. Self-elevate so the operator never needs an admin cmd.exe. If
-	//    we're not already elevated, re-launch ourselves with a UAC
-	//    prompt and let the elevated copy do the install.
-	if !isElevated() {
-		log.Info("not elevated — requesting admin via UAC")
-		if err := relaunchElevated("install"); err != nil {
-			log.Error("UAC elevation declined or failed", "err", err)
-			return 1
-		}
-		return 0
-	}
-
-	// 1. Resolve the absolute path of the .exe so the service registers
-	//    a stable BinaryPathName. SCM stores the literal path — if the
-	//    operator moved the exe later the service would fail to start.
-	exePath, err := os.Executable()
-	if err != nil {
-		log.Error("cannot resolve own executable path", "err", err)
-		return 1
-	}
-	exePath, _ = filepath.Abs(exePath)
-
-	// 2. Connect to the Service Control Manager. Fails (access denied)
-	//    when the user isn't running as admin.
+// registerService points the ESBMBridge service at exePath and starts
+// it. Callers must already be elevated and must already have stopped
+// any previous instance (see cmdFix, the only entry point).
+//
+// An existing registration is RECONFIGURED in place rather than deleted
+// and recreated. DeleteService merely marks the entry; Windows keeps it
+// until every open handle to it closes — an operator with services.msc
+// open is enough — and CreateService fails with ERROR_SERVICE_MARKED_
+// FOR_DELETE in the meantime. ChangeServiceConfig has no such trap.
+//
+// warns carries the non-fatal shortfalls (no restart policy, no
+// firewall rule) so the installer's summary cannot promise something
+// that was not actually set up.
+func registerService(log *slog.Logger, exePath string) (warns []string, err error) {
 	m, err := mgr.Connect()
 	if err != nil {
-		log.Error("connect to service manager failed (run as Administrator)", "err", err)
-		fmt.Fprintln(os.Stderr,
-			"Right-click cmd.exe / PowerShell and choose 'Run as administrator',\n"+
-				"then re-run: esbm-bridge install")
-		return 1
+		return nil, fmt.Errorf("connect to service manager (needs admin): %w", err)
 	}
 	defer m.Disconnect()
 
-	// 3. Remove any previous registration so re-install always works.
-	if s, err := m.OpenService(winservice.ServiceName); err == nil {
-		log.Info("removing existing service registration")
-		_ = stopService(s)
-		_ = s.Delete()
-		s.Close()
-		// SCM needs a moment to garbage-collect the old entry — give it 1s.
-		time.Sleep(1 * time.Second)
-	}
-
-	// 4. Create the service. The binary takes one argument: `run`,
-	//    which is the same command the operator would invoke
-	//    interactively. The service handler in main() flips into
-	//    SCM mode when launched without a controlling terminal.
+	// The binary takes one argument: `run`, the same command an operator
+	// would invoke interactively. main() flips into SCM mode when it is
+	// launched without a controlling terminal. CreateService builds the
+	// same `"<path>" run` string itself from exePath + args.
 	cfg := mgr.Config{
 		ServiceType:      windows.SERVICE_WIN32_OWN_PROCESS,
 		StartType:        mgr.StartAutomatic,
@@ -93,48 +71,83 @@ func cmdInstall(log *slog.Logger, _ []string) int {
 		BinaryPathName:   fmt.Sprintf(`"%s" run`, exePath),
 		DelayedAutoStart: false, // Boot fast — the gateway is waiting.
 	}
-	s, err := m.CreateService(winservice.ServiceName, exePath, cfg, "run")
+
+	// A registration that an earlier uninstall left "marked for
+	// deletion" rejects every call until its last handle closes. That
+	// usually takes a moment, so retry briefly before giving up with
+	// the specific error (the caller turns it into a plain instruction).
+	var s *mgr.Service
+	deadline := time.Now().Add(12 * time.Second)
+	for {
+		s, err = openOrCreate(log, m, cfg, exePath)
+		if err == nil || !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) ||
+			time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
 	if err != nil {
-		log.Error("create service failed", "err", err)
-		return 1
+		return nil, err
 	}
 	defer s.Close()
 
-	// 5. Auto-restart policy: if the worker crashes, SCM relaunches it
-	//    after 5s, 30s, 5min for the first three failures, then keeps
-	//    retrying every 5min. Reset the failure counter daily.
+	// Auto-restart policy: if the process dies, SCM relaunches it after
+	// 5s, 30s, 5min for the first three failures, then keeps retrying
+	// every 5min. Reset the failure counter daily. (A worker that merely
+	// RETURNS is re-run inside the service — see winservice.Execute.)
 	if err := s.SetRecoveryActions([]mgr.RecoveryAction{
 		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
 		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
 		{Type: mgr.ServiceRestart, Delay: 5 * time.Minute},
 	}, 86400); err != nil {
-		log.Warn("could not set recovery actions (non-fatal)", "err", err)
+		log.Warn("could not set recovery actions", "err", err)
+		warns = append(warns, "não consegui ligar o reinício automático em caso de queda")
 	}
 
-	// 6. Firewall rules. The gateway connects FROM the LAN, so we need
-	//    inbound TCP allow on 9071 + 9080. Scoped to this exe to keep
-	//    the rule narrow even if someone else listens on the same ports.
-	installFirewallRules(log, exePath)
-
-	// 7. Start the service so the gateway can reconnect immediately —
-	//    no reboot, no manual "Start" click in services.msc.
-	if err := s.Start(); err != nil {
-		log.Warn("service installed but failed to start now", "err", err,
-			"hint", "open services.msc and start 'ESBM Bridge' manually")
-		return 0 // install itself worked
+	// Firewall rules. The gateway connects FROM the LAN, so we need
+	// inbound TCP allow on 9071 + 9080. Scoped to this exe to keep the
+	// rule narrow even if someone else listens on the same ports.
+	if failed := installFirewallRules(log, exePath); len(failed) > 0 {
+		warns = append(warns, fmt.Sprintf("não consegui liberar no firewall "+
+			"do Windows a(s) porta(s) %s — se o Windows perguntar se permite "+
+			"o \"esbm-bridge\", responda Permitir", strings.Join(failed, ", ")))
 	}
 
-	log.Info("Bridge installed as a Windows service",
+	// Start now so the gateway reconnects immediately — no reboot, no
+	// manual "Start" click in services.msc.
+	if err := s.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		return warns, fmt.Errorf("start service: %w", err)
+	}
+	log.Info("Bridge registered as a Windows service",
 		"name", winservice.ServiceName, "exe", exePath)
-	fmt.Println()
-	fmt.Println("✓ ESBM Bridge is now a Windows service.")
-	fmt.Println("  - Starts automatically on boot")
-	fmt.Println("  - Restarts automatically if it crashes")
-	fmt.Println("  - Firewall rules added for ports 9071 + 9080")
-	fmt.Println()
-	fmt.Println("Manage via:  services.msc  →  ESBM Bridge")
-	fmt.Println("Uninstall:   esbm-bridge uninstall")
-	return 0
+	return warns, nil
+}
+
+// openOrCreate returns a handle to the service configured for exePath:
+// the existing registration, stopped and reconfigured, or a new one.
+func openOrCreate(log *slog.Logger, m *mgr.Mgr, cfg mgr.Config, exePath string) (*mgr.Service, error) {
+	s, err := m.OpenService(winservice.ServiceName)
+	if err != nil {
+		log.Info("creating the service", "exe", exePath)
+		s, err = m.CreateService(winservice.ServiceName, exePath, cfg, "run")
+		if err != nil {
+			return nil, fmt.Errorf("create service: %w", err)
+		}
+		return s, nil
+	}
+	log.Info("reconfiguring the existing service", "exe", exePath)
+	// It must be fully STOPPED before we start it again: StartService
+	// on a service that is still running or stopping either fails or —
+	// worse — is satisfied by the OLD image, and the new path we just
+	// configured would only take effect at the next boot.
+	if err := stopService(s); err != nil {
+		log.Warn("existing service not confirmed stopped before reconfigure", "err", err)
+	}
+	if err := s.UpdateConfig(cfg); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("update service config: %w", err)
+	}
+	return s, nil
 }
 
 func cmdUninstall(log *slog.Logger, _ []string) int {
@@ -169,36 +182,53 @@ func cmdUninstall(log *slog.Logger, _ []string) int {
 	return 0
 }
 
-// stopService asks SCM to stop and waits up to 10s for the worker to
-// transition to Stopped. Non-fatal if it times out — the caller is
-// usually about to Delete() the service anyway.
+// stopService asks SCM to stop the service and waits for it to report
+// Stopped. Returns nil only when the service IS stopped.
+//
+// It used to treat every ControlService error as "already stopped",
+// which is true for exactly one of them (ERROR_SERVICE_NOT_ACTIVE). A
+// service still in START_PENDING, or one whose handler is wedged,
+// rejects the Stop with a different error and is very much alive.
 func stopService(s *mgr.Service) error {
-	status, err := s.Control(svc.Stop)
+	st, err := s.Query()
 	if err != nil {
-		// Already stopped — fine.
+		return err
+	}
+	if st.State == svc.Stopped {
 		return nil
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for status.State != svc.Stopped {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("stop timeout (current state %d)", status.State)
-		}
-		time.Sleep(300 * time.Millisecond)
-		status, err = s.Query()
+	// The Control error is deliberately not returned. If Stop cannot be
+	// delivered (a pending state, a hung handler) we still poll: the
+	// caller may have killed the process, in which case SCM flips the
+	// service to Stopped on its own — and if it never does, the timeout
+	// below reports that honestly.
+	_, _ = s.Control(svc.Stop)
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		st, err = s.Query()
 		if err != nil {
 			return err
 		}
+		if st.State == svc.Stopped {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("stop timeout (current state %d)", st.State)
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
-	return nil
 }
 
-func installFirewallRules(log *slog.Logger, exePath string) {
-	// Best-effort: log failures but don't abort the install. If the
-	// firewall is already disabled or rule add fails, the operator can
-	// still allow the exe interactively the first time Windows asks.
+// installFirewallRules adds the inbound allow rules and returns the
+// ports it could NOT open, so the caller can say so.
+func installFirewallRules(log *slog.Logger, exePath string) (failed []string) {
+	// Best-effort: a failure does not abort the install. If the firewall
+	// is disabled or the rule add fails, Windows asks the operator the
+	// first time the service listens.
 	for _, r := range firewallRules {
 		// Remove any prior rule with the same name first so re-install
-		// doesn't end up with two identical rules.
+		// doesn't end up with two identical rules (or one that still
+		// points at the old download path).
 		_ = runQuiet("netsh", "advfirewall", "firewall", "delete", "rule",
 			"name="+r.name)
 		args := []string{
@@ -214,10 +244,12 @@ func installFirewallRules(log *slog.Logger, exePath string) {
 		if err := runQuiet("netsh", args...); err != nil {
 			log.Warn("firewall rule add failed (non-fatal)",
 				"port", r.port, "err", err)
+			failed = append(failed, fmt.Sprint(r.port))
 		} else {
 			log.Info("firewall rule added", "port", r.port, "name", r.name)
 		}
 	}
+	return failed
 }
 
 func removeFirewallRules(log *slog.Logger) {
@@ -231,11 +263,19 @@ func removeFirewallRules(log *slog.Logger) {
 	}
 }
 
-// runQuiet executes a command and returns its error, discarding output.
-// Used for the netsh calls so we don't spam the install log.
+// runQuiet executes a helper (netsh, schtasks) and returns its error,
+// discarding output. Two things matter now that the caller is a GUI
+// process with no console: without CREATE_NO_WINDOW every helper pops
+// its own black console window over the progress dialog, and without a
+// timeout a wedged firewall service would hang the install forever at a
+// point where the old Bridge is already stopped.
 func runQuiet(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: windows.CREATE_NO_WINDOW,
+	}
 	return cmd.Run()
 }

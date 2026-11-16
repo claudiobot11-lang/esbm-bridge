@@ -1,5 +1,6 @@
-// Stubs for `install` and `uninstall` on non-Windows builds — the
-// commands are visible in help but fail cleanly when invoked.
+// Stub for `uninstall` on non-Windows builds — the command is visible
+// in help but fails cleanly when invoked. (`install` is cmdFix, stubbed
+// in heal_other.go.)
 //
 //go:build !windows
 
@@ -10,11 +11,6 @@ import (
 	"log/slog"
 	"os"
 )
-
-func cmdInstall(_ *slog.Logger, _ []string) int {
-	fmt.Fprintln(os.Stderr, "install is Windows-only.")
-	return 2
-}
 
 func cmdUninstall(_ *slog.Logger, _ []string) int {
 	fmt.Fprintln(os.Stderr, "uninstall is Windows-only.")

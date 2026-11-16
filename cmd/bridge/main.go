@@ -25,6 +25,8 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -111,8 +113,10 @@ func main() {
 		os.Exit(cmdRun(log, args))
 	case "tray":
 		os.Exit(cmdTray(log, args))
-	case "install":
-		os.Exit(cmdInstall(log, args))
+	case "install", "fix":
+		// One flow for both names: close every stale Bridge, then
+		// install this copy as the service. See heal_windows.go.
+		os.Exit(cmdFix(log, args, hasConsole))
 	case "uninstall":
 		os.Exit(cmdUninstall(log, args))
 	case "status":
@@ -136,17 +140,17 @@ Usage:
   esbm-bridge pair      --code CODE [--server URL] Pair with esbm-app once (scripting)
   esbm-bridge tray                                 Run bridge + system tray icon + http://localhost:9099 dashboard
   esbm-bridge run                                  Start the bridge in the foreground (no tray)
-  esbm-bridge install                              Install as a Windows service (admin)
+  esbm-bridge install                              Close any old Bridge + install as a Windows service
   esbm-bridge uninstall                            Remove the Windows service (admin)
   esbm-bridge status                               Show paired state
   esbm-bridge version                              Print version
 
 Pairing codes come from the esbm-app /esl/stores page.
-Recommended flow on a store PC:
-  1. esbm-bridge pair --code CODE
-  2. (run cmd.exe as Administrator)  esbm-bridge install
-  → service starts now, auto-starts on every boot, restarts on crash,
-    and the Windows Firewall is opened for 9071 + 9080 automatically.
+On a store PC just double-click the .exe: it pairs if needed, closes any
+Bridge left running, copies itself to Program Files and installs the
+service (auto-start on boot, restart on crash, firewall for 9071 + 9080).
+Windows asks for administrator permission once. Same thing from a
+terminal:  esbm-bridge install
 `, version)
 }
 
@@ -330,10 +334,11 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	// operator can still see why.
 	dash := dashboard.New(dashboard.DefaultAddr, log)
 	dash.SetStatus(dashboard.Status{
-		Version:   version,
-		ShopCode:  cfg.ShopCode,
+		Version:    version,
+		ShopCode:   cfg.ShopCode,
 		ServerAddr: cfg.ServerAddr,
-		StartedAt: time.Now(),
+		StartedAt:  time.Now(),
+		PID:        os.Getpid(),
 	})
 
 	// Supervisor wraps each long-running goroutine with panic recovery
@@ -347,44 +352,91 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	// key if its own has expired (see KeyFunc below).
 	cli := api.New(cfg.EsbmAppURL, cfg.BridgeJWT)
 
-	// Ask the cloud where things are BEFORE building anything that dials
-	// it. config.json holds whatever was true at pair time, which can be
-	// months old: see FetchCloudConfig for the 20-hour outage this
-	// prevents. Best-effort on purpose — if the cloud is unreachable we
-	// carry on with the stored values rather than refusing to start.
-	func() {
+	// cfgMu guards cfg's mutable fields and cfg.Save (which writes a
+	// shared .tmp file) — three goroutines touch them: the cloud-config
+	// refresher, the tunnel's key callback, and the status pump.
+	var cfgMu sync.Mutex
+	getAddr := func() string {
+		cfgMu.Lock()
+		defer cfgMu.Unlock()
+		return cfg.ServerAddr
+	}
+
+	// refresh asks the cloud where eRetail lives (and for the current
+	// Tailscale key) and adopts whatever changed. config.json only holds
+	// what was true the last time we asked, which can be months old.
+	//
+	// This used to run exactly once, at process start. That was enough
+	// for a Bridge someone launched by hand; it is not enough for a
+	// service: (a) started at boot before the network is up, the single
+	// attempt fails and is never retried; (b) the process lives for
+	// months — the cloud address changed on 2026-11-13 and every running
+	// Bridge kept dialing the old one for 20 hours. So: once now, then
+	// forever on a timer, and immediately whenever a tunnel probe fails.
+	// onAddrChange is set once the proxies exist; refresh calls it after
+	// adopting a new eRetail address so sessions still attached to the
+	// old one are cut (see proxy.DropStale).
+	var onAddrChange atomic.Pointer[func()]
+	refresh := func(ctx context.Context) error {
 		c, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 		key, addr, err := cli.FetchCloudConfig(c)
 		if err != nil {
-			log.Warn("could not refresh cloud config at startup; using stored values", "err", err)
-			return
+			return err
 		}
-		changed := false
+		cfgMu.Lock()
+		changed, addrChanged := false, false
 		if addr != "" && addr != cfg.ServerAddr {
 			log.Info("eRetail address changed in cloud", "old", cfg.ServerAddr, "new", addr)
 			cfg.ServerAddr = addr
-			changed = true
+			changed, addrChanged = true, true
 		}
 		if key != "" && key != cfg.TailscaleAuthKey {
 			log.Info("tailscale auth key changed in cloud")
 			cfg.TailscaleAuthKey = key
 			changed = true
 		}
-		if !changed {
-			return
+		if changed {
+			if err := cfg.Save(); err != nil {
+				log.Warn("could not persist refreshed cloud config", "err", err)
+			}
 		}
-		if err := cfg.Save(); err != nil {
-			log.Warn("could not persist refreshed cloud config", "err", err)
-			return
+		cfgMu.Unlock()
+		// After the unlock, never under it: the hook reads the address
+		// back through getAddr, and cfgMu is not reentrant.
+		if addrChanged {
+			if f := onAddrChange.Load(); f != nil {
+				(*f)()
+			}
 		}
-		dash.SetStatus(dashboard.Status{
-			Version:    version,
-			ShopCode:   cfg.ShopCode,
-			ServerAddr: cfg.ServerAddr,
-			StartedAt:  time.Now(),
-		})
-	}()
+		return nil
+	}
+	// Synchronous first attempt, BEFORE building anything that dials the
+	// cloud. Best-effort: if it fails we start on the stored values and
+	// the worker below retries in 30s.
+	firstWait := 10 * time.Minute
+	if err := refresh(ctx); err != nil {
+		log.Warn("could not refresh cloud config at startup; using stored values (will retry)", "err", err)
+		firstWait = 30 * time.Second
+	}
+	cfgMu.Lock()
+	authKey := cfg.TailscaleAuthKey
+	cfgMu.Unlock()
+	supCfg := supervisor.Run(ctx, log, "cloudcfg", func(ctx context.Context) error {
+		// Sleep first: the synchronous attempt above just ran.
+		wait := firstWait
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(wait):
+			}
+			wait = 10 * time.Minute
+			if err := refresh(ctx); err != nil {
+				wait = 30 * time.Second
+			}
+		}
+	})
 
 	// Bring up Tailscale next — the proxies need the Dialer. SUPERVISED
 	// + health-checked (see tunnel.go): if the tunnel wedges into a
@@ -392,11 +444,20 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	// rebuilds tsnet from scratch — auto-reconnect. HealthAddr probes
 	// the cloud Cronus port (9071) through the VPN every 30s.
 	t := &tunnel.Tunnel{
-		Hostname:   cfg.Hostname,
-		AuthKey:    cfg.TailscaleAuthKey,
-		StateDir:   cfg.TailscaleStateDir,
-		Logger:     log,
-		HealthAddr: dialAddr(cfg.ServerAddr, 9071),
+		Hostname: cfg.Hostname,
+		AuthKey:  authKey,
+		StateDir: cfg.TailscaleStateDir,
+		Logger:   log,
+		// Resolved per probe, so an address the refresher just learned
+		// is probed on the very next tick.
+		HealthAddrFunc: func() string { return dialAddr(getAddr(), 9071) },
+		// A failed probe is the earliest sign the cloud moved: re-ask
+		// right then instead of waiting out the 10-minute timer.
+		OnUnhealthy: func(ctx context.Context) {
+			if err := refresh(ctx); err != nil {
+				log.Warn("cloud config refresh after failed probe did not succeed", "err", err)
+			}
+		},
 		// Self-heal a dead auth key instead of retrying it forever: pull
 		// the current one from esbm-app (we're already authenticated with
 		// the bridge JWT) and persist it so a restart keeps working.
@@ -406,8 +467,11 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 			return cli.FetchTSKey(c)
 		},
 		OnNewKey: func(k string) {
+			cfgMu.Lock()
 			cfg.TailscaleAuthKey = k
-			if err := cfg.Save(); err != nil {
+			err := cfg.Save()
+			cfgMu.Unlock()
+			if err != nil {
 				log.Warn("could not persist refreshed tailscale key", "err", err)
 			} else {
 				log.Info("refreshed tailscale auth key from cloud")
@@ -430,17 +494,19 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 	// Both upstreams are the same cloud server addr — the gateway
 	// picks whichever protocol it speaks.
 	srv9080 := &proxy.Server{
-		Listen:   "0.0.0.0:9080",
-		Upstream: dialAddr(cfg.ServerAddr, 9080),
-		Dialer:   t,
-		Logger:   log,
+		Listen:       "0.0.0.0:9080",
+		UpstreamFunc: func() string { return dialAddr(getAddr(), 9080) },
+		Dialer:       t,
+		Logger:       log,
 	}
 	srv9071 := &proxy.Server{
-		Listen:   "0.0.0.0:9071",
-		Upstream: dialAddr(cfg.ServerAddr, 9071),
-		Dialer:   t,
-		Logger:   log,
+		Listen:       "0.0.0.0:9071",
+		UpstreamFunc: func() string { return dialAddr(getAddr(), 9071) },
+		Dialer:       t,
+		Logger:       log,
 	}
+	dropStale := func() { srv9071.DropStale(); srv9080.DropStale() }
+	onAddrChange.Store(&dropStale)
 	sup9071 := supervisor.Run(ctx, log, "proxy:9071", srv9071.Run)
 	sup9080 := supervisor.Run(ctx, log, "proxy:9080", srv9080.Run)
 
@@ -463,18 +529,21 @@ func cmdRunCtx(ctx context.Context, log *slog.Logger) int {
 				return
 			case <-ticker.C:
 				dash.SetStatus(dashboard.Status{
-					Version:   version,
-					ShopCode:  cfg.ShopCode,
-					ServerAddr: cfg.ServerAddr,
-					StartedAt: dash.Snapshot().StartedAt,
+					Version:           version,
+					ShopCode:          cfg.ShopCode,
+					ServerAddr:        getAddr(),
+					StartedAt:         dash.Snapshot().StartedAt,
 					TailscaleHostname: cfg.Hostname,
-					TailscaleReady: t.Ready(),
+					TailscaleReady:    t.Ready(),
+					CloudReachable:    t.Reachable(),
+					PID:               os.Getpid(),
 					Workers: []supervisor.Status{
 						supDash.Snapshot(),
 						supTunnel.Snapshot(),
 						sup9071.Snapshot(),
 						sup9080.Snapshot(),
 						supHB.Snapshot(),
+						supCfg.Snapshot(),
 					},
 				})
 			}
@@ -579,7 +648,7 @@ func indexLastColon(s string) int {
 // *tunnel.Tunnel). Injected so the heartbeat reports the TRUTH instead
 // of the hardcoded `TailscaleOK: true` it used to send — that lie is why
 // a two-day outage looked perfectly healthy in the cloud dashboard.
-type tunnelState interface{ Ready() bool }
+type tunnelState interface{ Healthy() bool }
 
 func heartbeatLoop(ctx context.Context, log *slog.Logger, cli *api.Client, tun tunnelState, servers ...*proxy.Server) {
 	start := time.Now()
@@ -596,7 +665,7 @@ func heartbeatLoop(ctx context.Context, log *slog.Logger, cli *api.Client, tun t
 		for _, s := range servers {
 			msgs += s.MsgsLastMin()
 		}
-		tsOK := tun == nil || tun.Ready()
+		tsOK := tun == nil || tun.Healthy()
 		err := cli.SendHeartbeat(c, api.Heartbeat{
 			UptimeSec:       int64(time.Since(start).Seconds()),
 			Version:         version,
@@ -611,7 +680,7 @@ func heartbeatLoop(ctx context.Context, log *slog.Logger, cli *api.Client, tun t
 		if !tsOK {
 			_ = cli.SendEvent(c, api.Event{
 				Type: "tunnel_down", Severity: "error",
-				Message: "tailscale tunnel is not up — gateway traffic cannot reach the cloud",
+				Message: "tailscale tunnel is down or cannot reach eRetail — gateway traffic cannot reach the cloud",
 			})
 		}
 	}

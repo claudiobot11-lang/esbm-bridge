@@ -132,8 +132,24 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
+	// Flush before the rename. The file is now rewritten by a running
+	// service whenever the cloud address or key changes; a power cut
+	// between an unflushed write and the rename could leave an empty
+	// config.json, and a Bridge that boots "not paired".
 	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, p)

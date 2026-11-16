@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/windows/svc"
 )
@@ -77,7 +78,26 @@ func (h *handler) Execute(args []string, r <-chan svc.ChangeRequest, status chan
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		workerEC = uint32(h.runner(ctx, h.log))
+		// Re-run the worker if it ever returns on its own. It used to
+		// run exactly once: a worker that bailed out early (unreadable
+		// config at boot is the realistic case) left the service
+		// reporting RUNNING to Windows forever with nothing listening —
+		// and since the process never exits, the SCM recovery policy
+		// never fires either. Looping here is the only restart that can
+		// actually happen in that state.
+		for {
+			workerEC = uint32(h.runner(ctx, h.log))
+			if ctx.Err() != nil {
+				return
+			}
+			h.log.Error("bridge worker exited on its own; retrying in 30s",
+				"code", workerEC)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+			}
+		}
 	}()
 
 	status <- svc.Status{State: svc.Running, Accepts: acceptedCmds}
@@ -102,6 +122,7 @@ loop:
 	cancel()
 	wg.Wait()
 
-	status <- svc.Status{State: svc.Stopped}
-	return false, workerEC
+	// A stop we were asked for is a clean stop whatever the worker
+	// returned while unwinding; svc reports Stopped for us on return.
+	return false, 0
 }
